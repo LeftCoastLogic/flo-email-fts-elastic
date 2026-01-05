@@ -1,12 +1,14 @@
 /* Copyright (c) 2006-2014 Dovecot authors, see the included COPYING file */
 /* Copyright (c) 2014 Joshua Atkins <josh@ascendantcom.com> */
 /* Copyright (c) 2019-2020 Filip Hanes <filip.hanes@gmail.com> */
+/* Copyright (c) 2026 ThieuLe <quangthieuagu@gmail.com> */
 
 #include <ctype.h>
 #include <syslog.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <time.h>
 
 #include "lib.h"
 #include "array.h"
@@ -853,6 +855,11 @@ static int fts_backend_elastic_rescan(struct fts_backend *_backend)
 
         /* build json query for user box */
         buffer_set_used_size(query, 0);
+        unsigned int result_size_limit = 10000; /* default ES limit */
+        struct fts_elastic_user *fuser = FTS_ELASTIC_USER_CONTEXT(_backend->ns->user);
+        if (fuser != NULL) {
+            result_size_limit = fuser->set.result_size_limit;
+        }
         str_printfa(query,
             "{"
                 "\"query\":{"
@@ -864,9 +871,9 @@ static int fts_backend_elastic_rescan(struct fts_backend *_backend)
                     "}"
                 "},"
                 "\"_source\":false,"
-                "\"size\":10000"
+                "\"size\":%u"
             "}\n",
-            username, box_guid);
+            username, box_guid, result_size_limit);
 
         // download all uids for all boxes from elastic
         // we need scroll request because we don't know in advance
@@ -932,9 +939,55 @@ static int fts_backend_elastic_optimize(struct fts_backend *backend ATTR_UNUSED)
     return 0;
 }
 
+/* Structure to collect date range filters */
+struct elastic_date_filter {
+    time_t since;      /* SEARCH_SINCE, SEARCH_OR_NEWER */
+    time_t before;     /* SEARCH_BEFORE, SEARCH_OR_OLDER */
+    time_t on;          /* SEARCH_ON */
+    bool has_since;
+    bool has_before;
+    bool has_on;
+};
+
+/* Add date filter to date_filter structure */
+static void
+elastic_add_date_filter(struct elastic_date_filter *date_filter, 
+                       enum mail_search_arg_type type, time_t date_time)
+{
+    f_debug("start");
+    if (date_filter == NULL) {
+        return;
+    }
+
+    switch (type) {
+    case SEARCH_SINCE:
+    case SEARCH_OR_NEWER:
+        if (!date_filter->has_since || date_filter->since < date_time) {
+            date_filter->since = date_time;
+            date_filter->has_since = TRUE;
+        }
+        break;
+    case SEARCH_BEFORE:
+    case SEARCH_OR_OLDER:
+        if (!date_filter->has_before || date_filter->before > date_time) {
+            date_filter->before = date_time;
+            date_filter->has_before = TRUE;
+        }
+        break;
+    case SEARCH_ON:
+        date_filter->on = date_time;
+        date_filter->has_on = TRUE;
+        break;
+    default:
+        break;
+    }
+    f_debug("end");
+}
+
 static bool
 elastic_add_definite_query(string_t *_fields, string_t *_fields_not,
-                           string_t *value, struct mail_search_arg *arg)
+                           string_t *value, struct mail_search_arg *arg,
+                           struct elastic_date_filter *date_filter)
 {
     f_debug("start");
     string_t *fields = NULL;
@@ -975,6 +1028,19 @@ elastic_add_definite_query(string_t *_fields, string_t *_fields_not,
         str_printfa(fields, "\"%s\",", elastic_field_prepare(arg->hdr_field_name));
 
         break;
+    case SEARCH_SINCE:
+    case SEARCH_BEFORE:
+    case SEARCH_ON:
+    case SEARCH_OR_OLDER:
+    case SEARCH_OR_NEWER:
+        /* handle date range filters - these go into filter section, not must */
+        if (date_filter != NULL && arg->value.time != 0) {
+            elastic_add_date_filter(date_filter, arg->type, arg->value.time);
+            /* mark as handled so Dovecot doesn't fall back */
+            arg->match_always = TRUE;
+            return TRUE;
+        }
+        return FALSE;
     default:
         return FALSE;
     }
@@ -985,7 +1051,8 @@ elastic_add_definite_query(string_t *_fields, string_t *_fields_not,
 
 static bool
 elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
-                                string_t *value, struct mail_search_arg *arg)
+                                string_t *value, struct mail_search_arg *arg,
+                                struct elastic_date_filter *date_filter)
 {
     f_debug("start");
     bool field_added = FALSE;
@@ -1000,16 +1067,21 @@ elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
         /* multiple fields have an initial arg of nothing useful and subargs */
         if (arg->value.subargs != NULL) {
             field_added = elastic_add_definite_query_args(fields, fields_not, value,
-                arg->value.subargs);
+                arg->value.subargs, date_filter);
         }
 
-        if (elastic_add_definite_query(fields, fields_not, value, arg)) {
+        if (elastic_add_definite_query(fields, fields_not, value, arg, date_filter)) {
             /* the value is the same for every arg passed, only add the value
              * to our search json once. */
             if (!field_added) {
                 /* we always want to add the value */
-                str_append_json_escaped(value,
-                        arg->value.str, strlen(arg->value.str));
+                /* skip adding value for date filters - they don't need query text */
+                if (arg->type != SEARCH_SINCE && arg->type != SEARCH_BEFORE && 
+                    arg->type != SEARCH_ON && arg->type != SEARCH_OR_OLDER && 
+                    arg->type != SEARCH_OR_NEWER && arg->value.str != NULL) {
+                    str_append_json_escaped(value,
+                            arg->value.str, strlen(arg->value.str));
+                }
             }
 
             /* this is important to set. if this is FALSE, Dovecot will fail
@@ -1059,6 +1131,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
     string_t *match_query = str_new(pool, 1024);
     string_t *fields = str_new(pool, 1024);
     string_t *fields_not = str_new(pool, 1024);
+    struct elastic_date_filter date_filter = {0};
 
     /* validate our input */
     if (_backend == NULL || box == NULL || args == NULL || result_r == NULL) {
@@ -1073,8 +1146,8 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
     }
     f_debug("box_guid: %s", box_guid);
 
-    /* attempt to build the match_query */
-    if (!elastic_add_definite_query_args(fields, fields_not, match_query, args)) {
+    /* attempt to build the match_query and collect date filters */
+    if (!elastic_add_definite_query_args(fields, fields_not, match_query, args, &date_filter)) {
         f_debug("return -1");
         return -1;
     }
@@ -1092,46 +1165,138 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         str_append(fields, "\"from\",\"to\",\"cc\",\"bcc\",\"sender\",\"subject\",\"body\"");
     }
 
+    /* get settings */
+    struct fts_elastic_user *fuser = FTS_ELASTIC_USER_CONTEXT(_backend->ns->user);
+    unsigned int result_size_limit = 10000; /* default ES limit */
+    bool apply_default_date_range = FALSE;
+    
+    if (fuser != NULL) {
+        result_size_limit = fuser->set.result_size_limit;
+    }
+    
+    /* apply default date range if:
+     * 1. default_date_range_months is configured (1, 3, or 6)
+     * 2. no date filter was specified by user
+     * 3. we're searching in body field (to optimize body search performance)
+     */
+    if (fuser != NULL && fuser->set.default_date_range_months > 0 &&
+        !date_filter.has_on && !date_filter.has_since && !date_filter.has_before) {
+        /* check if we're searching in body field */
+        const char *fields_str = str_c(fields);
+        if (fields_str != NULL && strstr(fields_str, "\"body\"") != NULL) {
+            apply_default_date_range = TRUE;
+        }
+    }
+
     /* generate json search query */
     str_append(query, "{\"query\":{\"bool\":{\"filter\":[");
-    str_printfa(query, "{\"term\":{\"user\":\"%s\"}},"
-                     "{\"term\":{\"box\":\"%s\"}}]",
-                        _backend->ns->owner != NULL ? _backend->ns->owner->username : "",
+    str_printfa(query, "{\"term\":{\"user\":\"%s\"}},",
+                        _backend->ns->owner != NULL ? _backend->ns->owner->username : "");
+    str_printfa(query, "{\"term\":{\"box\":\"%s\"}}",
                         box_guid);
+    
+    /* add date range filters for better performance */
+    if (date_filter.has_on) {
+        /* SEARCH_ON: exact date match - use range query for the entire day */
+        struct tm *tm = gmtime(&date_filter.on);
+        char date_start[64], date_end[64];
+        /* Format: "d MMM yyyy HH:mm:ss" to match schema format */
+        strftime(date_start, sizeof(date_start), "%d %b %Y 00:00:00", tm);
+        strftime(date_end, sizeof(date_end), "%d %b %Y 23:59:59", tm);
+        str_append(query, ",");
+        str_printfa(query, "{\"range\":{\"date\":{\"gte\":\"%s\",\"lte\":\"%s\"}}}",
+                            date_start, date_end);
+    } else {
+        /* SEARCH_SINCE or SEARCH_OR_NEWER */
+        if (date_filter.has_since) {
+            struct tm *tm = gmtime(&date_filter.since);
+            char date_str[64];
+            /* Format: "d MMM yyyy HH:mm:ss" to match schema format */
+            strftime(date_str, sizeof(date_str), "%d %b %Y %H:%M:%S", tm);
+            str_append(query, ",");
+            str_printfa(query, "{\"range\":{\"date\":{\"gte\":\"%s\"}}}", date_str);
+        }
+        /* SEARCH_BEFORE or SEARCH_OR_OLDER */
+        if (date_filter.has_before) {
+            struct tm *tm = gmtime(&date_filter.before);
+            char date_str[64];
+            /* Format: "d MMM yyyy HH:mm:ss" to match schema format */
+            strftime(date_str, sizeof(date_str), "%d %b %Y %H:%M:%S", tm);
+            str_append(query, ",");
+            str_printfa(query, "{\"range\":{\"date\":{\"lt\":\"%s\"}}}", date_str);
+        }
+        
+        /* apply default date range if configured and no user date filter */
+        if (apply_default_date_range) {
+            time_t now = time(NULL);
+            struct tm *tm = gmtime(&now);
+            
+            /* subtract months */
+            int months = fuser->set.default_date_range_months;
+            int year = tm->tm_year;
+            int mon = tm->tm_mon;
+            
+            mon -= months;
+            while (mon < 0) {
+                mon += 12;
+                year--;
+            }
+            
+            /* create new tm struct with adjusted date */
+            struct tm months_ago_tm = *tm;
+            months_ago_tm.tm_year = year;
+            months_ago_tm.tm_mon = mon;
+            months_ago_tm.tm_mday = 1; /* start of month */
+            months_ago_tm.tm_hour = 0;
+            months_ago_tm.tm_min = 0;
+            months_ago_tm.tm_sec = 0;
+            
+            char date_str[64];
+            /* Format: "d MMM yyyy HH:mm:ss" to match schema format */
+            strftime(date_str, sizeof(date_str), "%d %b %Y %H:%M:%S", &months_ago_tm);
+            str_append(query, ",");
+            str_printfa(query, "{\"range\":{\"date\":{\"gte\":\"%s\"}}}", date_str);
+            i_debug("fts_elastic: Applied default date range filter: last %d months for body search", months);
+        }
+    }
+    
+    str_append(query, "]");
 
-    if (str_len(fields) > 0) {
+    if (str_len(fields) > 0 && str_len(match_query) > 0) {
         str_append(query, ",\"must\":[");
         /* optimize: use match query for single field (especially body), multi_match for multiple fields */
         const char *fields_str = str_c(fields);
+        const char *match_query_str = str_c(match_query);
         /* check if we have only one field (no comma in the string after removing trailing comma) */
         if (strchr(fields_str, ',') == NULL) {
             /* single field - use match query for better performance */
-            str_printfa(query, JSON_MATCH, fields_str, str_c(match_query), operator_arg);
+            str_printfa(query, JSON_MATCH, fields_str, match_query_str, operator_arg);
         } else {
             /* multiple fields - use multi_match with optimization */
-            str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
+            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
                                    operator_arg, fields_str);
         }
         str_append(query, "]");
     }
 
-    if (str_len(fields_not) > 0) {
+    if (str_len(fields_not) > 0 && str_len(match_query) > 0) {
         str_append(query, ",\"must_not\":[");
         /* optimize: use match query for single field, multi_match for multiple fields */
         const char *fields_not_str = str_c(fields_not);
+        const char *match_query_str = str_c(match_query);
         if (strchr(fields_not_str, ',') == NULL) {
             /* single field - use match query for better performance */
-            str_printfa(query, JSON_MATCH, fields_not_str, str_c(match_query), operator_arg);
+            str_printfa(query, JSON_MATCH, fields_not_str, match_query_str, operator_arg);
         } else {
             /* multiple fields - use multi_match with optimization */
-            str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
+            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
                                    operator_arg, fields_not_str);
         }
         str_append(query, "]");
     }
 
-    /* default ES is limited to 10,000 results */
-    str_append(query, "}},\"size\":10000,\"_source\":false}\n");
+    /* use configured result size limit */
+    str_printfa(query, "}},\"size\":%u,\"_source\":false}\n", result_size_limit);
 
     /* build our fts_result return */
     result_r->box = box;
@@ -1143,7 +1308,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         status.messages = 1;
     }
 
-    if (status.messages > 10000) {
+    if (status.messages > result_size_limit) {
         ret = elastic_connection_search_scroll(backend->conn, pool, query, result_r);
     } else {
         ret = elastic_connection_search(backend->conn, pool, query, result_r);
