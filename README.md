@@ -39,7 +39,7 @@ Create /etc/dovecot/conf.d/90-fts.conf with content:
 
 	plugin {
 	  fts = elastic
-	  fts_elastic = debug url=http://localhost:9200/m/ bulk_size=5000000 refresh=fts rawlog_dir=/var/log/fts-elastic/ default_date_range=3
+	  fts_elastic = debug url=http://localhost:9200/m/ bulk_size=5000000 refresh=fts rawlog_dir=/var/log/fts-elastic/ default_date_range=3 result_size_limit=500
 
 	  # no indexes new emails when user make search
 	  # yes indexes every email when delivered
