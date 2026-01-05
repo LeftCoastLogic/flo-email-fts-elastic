@@ -26,6 +26,100 @@
 static const char *elastic_field_replace_chars = ".#*\"";
 static const char *escape_hex_chars = "0123456789abcdefABCDEF";
 
+/* Strip HTML tags from body content for better indexing */
+static void
+elastic_strip_html_tags(string_t *dest, const char *data, size_t len)
+{
+    f_debug("start");
+    size_t pos = 0;
+    bool in_tag = FALSE;
+    bool in_entity = FALSE;
+    size_t entity_start = 0;
+    unsigned char c;
+
+    while (pos < len) {
+        c = data[pos];
+
+        if (in_tag) {
+            /* we're inside an HTML tag, skip until we find '>' */
+            if (c == '>') {
+                in_tag = FALSE;
+                /* add a space to separate words that were separated by tags */
+                if (str_len(dest) > 0 && str_c(dest)[str_len(dest) - 1] != ' ') {
+                    str_append_c(dest, ' ');
+                }
+            }
+            pos++;
+            continue;
+        }
+
+        if (c == '<') {
+            /* start of HTML tag */
+            in_tag = TRUE;
+            pos++;
+            continue;
+        }
+
+        if (c == '&') {
+            /* might be HTML entity, check if it's a valid one */
+            in_entity = TRUE;
+            entity_start = pos;
+            pos++;
+            continue;
+        }
+
+        if (in_entity) {
+            /* we're inside an HTML entity */
+            if (c == ';') {
+                /* end of entity, decode common ones */
+                size_t entity_len = pos - entity_start + 1; /* include ';' */
+                if (entity_len <= 10) { /* reasonable entity length */
+                    const char *entity = data + entity_start;
+                    size_t entity_content_len = entity_len - 1; /* length without ';' */
+                    if (entity_content_len == 4 && memcmp(entity, "&lt;", 4) == 0) {
+                        str_append_c(dest, '<');
+                    } else if (entity_content_len == 4 && memcmp(entity, "&gt;", 4) == 0) {
+                        str_append_c(dest, '>');
+                    } else if (entity_content_len == 5 && memcmp(entity, "&amp;", 5) == 0) {
+                        str_append_c(dest, '&');
+                    } else if (entity_content_len == 6 && memcmp(entity, "&quot;", 6) == 0) {
+                        str_append_c(dest, '"');
+                    } else if (entity_content_len == 6 && memcmp(entity, "&apos;", 6) == 0) {
+                        str_append_c(dest, '\'');
+                    } else if (entity_content_len == 6 && memcmp(entity, "&nbsp;", 6) == 0) {
+                        str_append_c(dest, ' ');
+                    } else {
+                        /* unknown entity, just skip it and add space */
+                        str_append_c(dest, ' ');
+                    }
+                } else {
+                    str_append_c(dest, ' ');
+                }
+                in_entity = FALSE;
+            } else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+                         (c >= '0' && c <= '9') || c == '#')) {
+                /* invalid entity character, treat as normal text */
+                buffer_append(dest, data + entity_start, pos - entity_start);
+                in_entity = FALSE;
+                continue;
+            }
+            pos++;
+            continue;
+        }
+
+        /* normal character, append it */
+        str_append_c(dest, c);
+        pos++;
+    }
+
+    /* handle case where we ended in the middle of an entity */
+    if (in_entity) {
+        buffer_append(dest, data + entity_start, len - entity_start);
+    }
+
+    f_debug("end");
+}
+
 struct elastic_fts_backend {
     struct fts_backend backend;
     struct elastic_connection *conn;
@@ -560,7 +654,13 @@ fts_backend_elastic_update_build_more(struct fts_backend_update_context *_ctx,
         return -1;
     }
 
-    buffer_append(ctx->current_value, (const char *)data, size);
+    /* if we're building body field, strip HTML tags for better indexing */
+    if (ctx->body_open && str_len(ctx->current_key) > 0 && 
+        strcasecmp(str_c(ctx->current_key), "body") == 0) {
+        elastic_strip_html_tags(ctx->current_value, (const char *)data, size);
+    } else {
+        buffer_append(ctx->current_value, (const char *)data, size);
+    }
     f_debug("end");
     return 0;
 }
@@ -935,7 +1035,15 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         "{\"multi_match\":{"
             "\"query\":\"%s\","
             "\"operator\":\"%s\","
+            "\"type\":\"best_fields\","
             "\"fields\":[%s]"
+        "}}";
+    static const char JSON_MATCH[] = 
+        "{\"match\":{"
+            "\"%s\":{"
+                "\"query\":\"%s\","
+                "\"operator\":\"%s\""
+            "}"
         "}}";
 
     struct elastic_fts_backend *backend = (struct elastic_fts_backend *)_backend;
@@ -971,9 +1079,13 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         return -1;
     }
 
-    /* remove the trailing ',' */
-    str_delete(fields, str_len(fields) - 1, 1);
-    str_delete(fields_not, str_len(fields_not) - 1, 1);
+    /* remove the trailing ',' if fields exist */
+    if (str_len(fields) > 0) {
+        str_delete(fields, str_len(fields) - 1, 1);
+    }
+    if (str_len(fields_not) > 0) {
+        str_delete(fields_not, str_len(fields_not) - 1, 1);
+    }
 
     /* if no fields were added, add some sensible default fields */
     if (str_len(fields) == 0 && str_len(fields_not) == 0) {
@@ -989,15 +1101,32 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
 
     if (str_len(fields) > 0) {
         str_append(query, ",\"must\":[");
-        str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
-                               operator_arg, str_c(fields));
+        /* optimize: use match query for single field (especially body), multi_match for multiple fields */
+        const char *fields_str = str_c(fields);
+        /* check if we have only one field (no comma in the string after removing trailing comma) */
+        if (strchr(fields_str, ',') == NULL) {
+            /* single field - use match query for better performance */
+            str_printfa(query, JSON_MATCH, fields_str, str_c(match_query), operator_arg);
+        } else {
+            /* multiple fields - use multi_match with optimization */
+            str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
+                                   operator_arg, fields_str);
+        }
         str_append(query, "]");
     }
 
     if (str_len(fields_not) > 0) {
         str_append(query, ",\"must_not\":[");
-        str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
-                               operator_arg, str_c(fields_not));
+        /* optimize: use match query for single field, multi_match for multiple fields */
+        const char *fields_not_str = str_c(fields_not);
+        if (strchr(fields_not_str, ',') == NULL) {
+            /* single field - use match query for better performance */
+            str_printfa(query, JSON_MATCH, fields_not_str, str_c(match_query), operator_arg);
+        } else {
+            /* multiple fields - use multi_match with optimization */
+            str_printfa(query, JSON_MULTI_MATCH, str_c(match_query),
+                                   operator_arg, fields_not_str);
+        }
         str_append(query, "]");
     }
 
