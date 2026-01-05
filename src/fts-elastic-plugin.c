@@ -39,6 +39,8 @@ fts_elastic_plugin_init_settings(struct mail_user *user,
     set->bulk_size = 5*1024*1024; /* 5 MB */
     set->refresh_by_fts = TRUE;
     set->refresh_on_update = FALSE;
+    set->default_date_range_months = 0; /* disabled by default */
+    set->result_size_limit = 10000; /* default ES limit */
 
     tmp = t_strsplit_spaces(str, " ");
     for (; *tmp != NULL; tmp++) {
@@ -63,6 +65,28 @@ fts_elastic_plugin_init_settings(struct mail_user *user,
 				set->refresh_by_fts = TRUE;
 			} else {
 				i_error("fts_elastic: Invalid setting for refresh: %s", *tmp+8);
+				return -1;
+			}
+		} else if (strncmp(*tmp, "default_date_range=", 19) == 0) {
+			unsigned int months;
+			const char *range_str = *tmp + 19;
+			if (strcmp(range_str, "1") == 0 || strcmp(range_str, "1month") == 0) {
+				set->default_date_range_months = 1;
+			} else if (strcmp(range_str, "3") == 0 || strcmp(range_str, "3months") == 0) {
+				set->default_date_range_months = 3;
+			} else if (strcmp(range_str, "6") == 0 || strcmp(range_str, "6months") == 0) {
+				set->default_date_range_months = 6;
+			} else if (strcmp(range_str, "0") == 0 || strcmp(range_str, "disabled") == 0) {
+				set->default_date_range_months = 0;
+			} else if (str_to_uint(range_str, &months) == 0 && (months == 1 || months == 3 || months == 6)) {
+				set->default_date_range_months = months;
+			} else {
+				i_error("fts_elastic: Invalid default_date_range value: %s (valid: 0/disabled, 1/1month, 3/3months, 6/6months)", range_str);
+				return -1;
+			}
+		} else if (strncmp(*tmp, "result_size_limit=", 19) == 0) {
+			if (str_to_uint(*tmp+19, &set->result_size_limit) < 0 || set->result_size_limit == 0) {
+				i_error("fts_elastic: result_size_limit='%s' must be a positive integer", *tmp+19);
 				return -1;
 			}
         } else {

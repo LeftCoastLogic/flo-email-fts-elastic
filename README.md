@@ -39,7 +39,7 @@ Create /etc/dovecot/conf.d/90-fts.conf with content:
 
 	plugin {
 	  fts = elastic
-	  fts_elastic = debug url=http://localhost:9200/m/ bulk_size=5000000 refresh=fts rawlog_dir=/var/log/fts-elastic/
+	  fts_elastic = debug url=http://localhost:9200/m/ bulk_size=5000000 refresh=fts rawlog_dir=/var/log/fts-elastic/ default_date_range=3 result_size_limit=500
 
 	  # no indexes new emails when user make search
 	  # yes indexes every email when delivered
@@ -60,6 +60,8 @@ and (re)start dovecot:
   * never: leave it to elastic, indexed emails may not be searchable immediately
 * debug Enables HTTP debugging
 * rawlog_dir is directory where HTTP communication with elasticsearch server is written (useful for debugging plugin or elastic schema)
+* default_date_range={0/disabled,1/1month,3/3months,6/6months} Automatically apply date range filter when searching body field to improve performance with large mailboxes. This setting adds a date range filter (last N months) to body searches when user doesn't specify a date range. User-specified date ranges (e.g., SINCE 1-MONTH-AGO) will override this default. Recommended: 3 months for optimal performance. (default=0/disabled)
+* result_size_limit=\<positive integer\> Maximum number of results to return from Elasticsearch per query. When mailbox has more messages than this limit, scroll API will be used automatically. (default=10000)
 
 ## ElasticSearch index
 This plugin stores all message in one elastic index. You can use [sharding](https://www.elastic.co/guide/en/elasticsearch/reference/current/scalability.html) to support large numbers of users. Since it uses [routing key](https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-routing-field.html), updates and searches are accessing only one shard.

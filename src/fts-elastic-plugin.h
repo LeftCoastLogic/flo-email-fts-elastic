@@ -22,6 +22,8 @@ struct fts_elastic_settings {
     bool refresh_on_update;	/* if we want add ?refresh=true to elastic query*/
     bool refresh_by_fts;	/* if we want to allow refresh http request called by fts plugin */
     bool debug;			    /* whether or not debug is set */
+    unsigned int default_date_range_months; /* default date range in months (0=disabled, 1/3/6 months) for body search optimization */
+    unsigned int result_size_limit; /* maximum number of results to return from Elasticsearch (default=10000) */
 };
 
 struct fts_elastic_user {
