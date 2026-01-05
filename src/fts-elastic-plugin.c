@@ -84,9 +84,9 @@ fts_elastic_plugin_init_settings(struct mail_user *user,
 				i_error("fts_elastic: Invalid default_date_range value: %s (valid: 0/disabled, 1/1month, 3/3months, 6/6months)", range_str);
 				return -1;
 			}
-		} else if (strncmp(*tmp, "result_size_limit=", 19) == 0) {
-			if (str_to_uint(*tmp+19, &set->result_size_limit) < 0 || set->result_size_limit == 0) {
-				i_error("fts_elastic: result_size_limit='%s' must be a positive integer", *tmp+19);
+		} else if (strncmp(*tmp, "result_size_limit=", 18) == 0) {
+			if (str_to_uint(*tmp+18, &set->result_size_limit) < 0 || set->result_size_limit == 0) {
+				i_error("fts_elastic: result_size_limit='%s' must be a positive integer", *tmp+18);
 				return -1;
 			}
         } else {
