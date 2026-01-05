@@ -941,8 +941,8 @@ static int fts_backend_elastic_optimize(struct fts_backend *backend ATTR_UNUSED)
 
 /* Structure to collect date range filters */
 struct elastic_date_filter {
-    time_t since;      /* SEARCH_SINCE, SEARCH_OR_NEWER */
-    time_t before;     /* SEARCH_BEFORE, SEARCH_OR_OLDER */
+    time_t since;      /* SEARCH_SINCE */
+    time_t before;     /* SEARCH_BEFORE */
     time_t on;          /* SEARCH_ON */
     bool has_since;
     bool has_before;
@@ -961,14 +961,12 @@ elastic_add_date_filter(struct elastic_date_filter *date_filter,
 
     switch (type) {
     case SEARCH_SINCE:
-    case SEARCH_OR_NEWER:
         if (!date_filter->has_since || date_filter->since < date_time) {
             date_filter->since = date_time;
             date_filter->has_since = TRUE;
         }
         break;
     case SEARCH_BEFORE:
-    case SEARCH_OR_OLDER:
         if (!date_filter->has_before || date_filter->before > date_time) {
             date_filter->before = date_time;
             date_filter->has_before = TRUE;
@@ -1031,8 +1029,6 @@ elastic_add_definite_query(string_t *_fields, string_t *_fields_not,
     case SEARCH_SINCE:
     case SEARCH_BEFORE:
     case SEARCH_ON:
-    case SEARCH_OR_OLDER:
-    case SEARCH_OR_NEWER:
         /* handle date range filters - these go into filter section, not must */
         if (date_filter != NULL && arg->value.time != 0) {
             elastic_add_date_filter(date_filter, arg->type, arg->value.time);
@@ -1077,8 +1073,7 @@ elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
                 /* we always want to add the value */
                 /* skip adding value for date filters - they don't need query text */
                 if (arg->type != SEARCH_SINCE && arg->type != SEARCH_BEFORE && 
-                    arg->type != SEARCH_ON && arg->type != SEARCH_OR_OLDER && 
-                    arg->type != SEARCH_OR_NEWER && arg->value.str != NULL) {
+                    arg->type != SEARCH_ON && arg->value.str != NULL) {
                     str_append_json_escaped(value,
                             arg->value.str, strlen(arg->value.str));
                 }
@@ -1207,7 +1202,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         str_printfa(query, "{\"range\":{\"date\":{\"gte\":\"%s\",\"lte\":\"%s\"}}}",
                             date_start, date_end);
     } else {
-        /* SEARCH_SINCE or SEARCH_OR_NEWER */
+        /* SEARCH_SINCE */
         if (date_filter.has_since) {
             struct tm *tm = gmtime(&date_filter.since);
             char date_str[64];
@@ -1216,7 +1211,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
             str_append(query, ",");
             str_printfa(query, "{\"range\":{\"date\":{\"gte\":\"%s\"}}}", date_str);
         }
-        /* SEARCH_BEFORE or SEARCH_OR_OLDER */
+        /* SEARCH_BEFORE */
         if (date_filter.has_before) {
             struct tm *tm = gmtime(&date_filter.before);
             char date_str[64];
