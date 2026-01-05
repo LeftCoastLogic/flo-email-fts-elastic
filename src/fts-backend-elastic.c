@@ -1265,7 +1265,17 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         /* check if we have only one field (no comma in the string after removing trailing comma) */
         if (strchr(fields_str, ',') == NULL) {
             /* single field - use match query for better performance */
-            str_printfa(query, JSON_MATCH, fields_str, match_query_str, operator_arg);
+            /* remove quotes from field name (fields_str contains "fieldname") */
+            const char *field_name = fields_str;
+            size_t field_name_len = strlen(field_name);
+            if (field_name_len >= 2 && field_name[0] == '"' && field_name[field_name_len-1] == '"') {
+                /* extract field name without quotes */
+                string_t *field_name_clean = str_new(pool, 64);
+                buffer_append(field_name_clean, field_name + 1, field_name_len - 2);
+                str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+            } else {
+                str_printfa(query, JSON_MATCH, fields_str, match_query_str, operator_arg);
+            }
         } else {
             /* multiple fields - use multi_match with optimization */
             str_printfa(query, JSON_MULTI_MATCH, match_query_str,
@@ -1281,7 +1291,17 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         const char *match_query_str = str_c(match_query);
         if (strchr(fields_not_str, ',') == NULL) {
             /* single field - use match query for better performance */
-            str_printfa(query, JSON_MATCH, fields_not_str, match_query_str, operator_arg);
+            /* remove quotes from field name (fields_not_str contains "fieldname") */
+            const char *field_name = fields_not_str;
+            size_t field_name_len = strlen(field_name);
+            if (field_name_len >= 2 && field_name[0] == '"' && field_name[field_name_len-1] == '"') {
+                /* extract field name without quotes */
+                string_t *field_name_clean = str_new(pool, 64);
+                buffer_append(field_name_clean, field_name + 1, field_name_len - 2);
+                str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+            } else {
+                str_printfa(query, JSON_MATCH, fields_not_str, match_query_str, operator_arg);
+            }
         } else {
             /* multiple fields - use multi_match with optimization */
             str_printfa(query, JSON_MULTI_MATCH, match_query_str,
