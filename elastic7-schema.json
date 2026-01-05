@@ -15,6 +15,11 @@
             "type": "pattern_replace",
             "pattern": "(<[^>]*>)",
             "replacement": " "
+          },
+          "strip_html_tags": {
+            "type": "pattern_replace",
+            "pattern": "<[^>]+>",
+            "replacement": " "
           }
         },
         "filter": {
@@ -50,6 +55,7 @@
         "analyzer": {
           "body": {
             "tokenizer": "standard",
+            "char_filter": ["strip_html_tags"],
             "filter": ["asciifolding", "lowercase", "unique", "max50char", "limit1000"]
           },
           "email": {
