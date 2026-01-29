@@ -167,6 +167,56 @@ static const char *elastic_field_prepare(const char *field)
     return t_str_lcase(field);
 }
 
+/* Check if field is email address field (from, to, sender, cc, bcc) - use wildcard for full-address search */
+static bool
+elastic_field_is_email_address(const char *field_name)
+{
+    f_debug("start");
+    if (field_name == NULL) {
+        return FALSE;
+    }
+    return (strcmp(field_name, "from") == 0 || strcmp(field_name, "to") == 0 ||
+            strcmp(field_name, "sender") == 0 || strcmp(field_name, "cc") == 0 ||
+            strcmp(field_name, "bcc") == 0);
+}
+
+/* Parse next quoted field from fields string (e.g. "\"from\",\"to\""). Returns pointer after field or NULL. */
+static const char *
+parse_next_quoted_field(const char *input, string_t *field_name_out)
+{
+    const char *p = input;
+    while (*p == ' ' || *p == ',') p++;
+    if (!*p || *p != '"') return NULL;
+    p++;
+    str_truncate(field_name_out, 0);
+    while (*p && *p != '"') {
+        str_append_c(field_name_out, *p);
+        p++;
+    }
+    if (*p != '"') return NULL;
+    p++;
+    return p;
+}
+
+/* Escape wildcard special chars (\ * ?) for Elasticsearch wildcard query */
+static void
+str_append_wildcard_escaped(string_t *dest, const char *data, size_t len)
+{
+    f_debug("start");
+    size_t pos = 0;
+    unsigned char c;
+
+    while (pos < len) {
+        c = data[pos];
+        if (c == '\\' || c == '*' || c == '?') {
+            str_append_c(dest, '\\');
+        }
+        str_append_c(dest, c);
+        pos++;
+    }
+    f_debug("end");
+}
+
 /* copied and edited from https://github.com/json-c/json-c/blob/1934eddf2968a103e943b2938558c1a07054e26f/json_object.c#L106 */
 static void str_append_json_escaped(string_t *dest, const char *data, size_t len)
 {
@@ -1047,7 +1097,8 @@ elastic_add_definite_query(string_t *_fields, string_t *_fields_not,
 
 static bool
 elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
-                                string_t *value, struct mail_search_arg *arg,
+                                string_t *value, string_t *value_raw,
+                                struct mail_search_arg *arg,
                                 struct elastic_date_filter *date_filter)
 {
     f_debug("start");
@@ -1063,7 +1114,7 @@ elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
         /* multiple fields have an initial arg of nothing useful and subargs */
         if (arg->value.subargs != NULL) {
             field_added = elastic_add_definite_query_args(fields, fields_not, value,
-                arg->value.subargs, date_filter);
+                value_raw, arg->value.subargs, date_filter);
         }
 
         if (elastic_add_definite_query(fields, fields_not, value, arg, date_filter)) {
@@ -1076,6 +1127,9 @@ elastic_add_definite_query_args(string_t *fields, string_t *fields_not,
                     arg->type != SEARCH_ON && arg->value.str != NULL) {
                     str_append_json_escaped(value,
                             arg->value.str, strlen(arg->value.str));
+                    if (value_raw != NULL) {
+                        str_append(value_raw, arg->value.str);
+                    }
                 }
             }
 
@@ -1112,6 +1166,14 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
                 "\"operator\":\"%s\""
             "}"
         "}}";
+    /* wildcard on field (from/to/cc/...) for full-address search; value already has *...* from code */
+    static const char JSON_WILDCARD_FULL[] =
+        "{\"wildcard\":{"
+            "\"%s\":{"
+                "\"value\":\"%s\","
+                "\"case_insensitive\":true"
+            "}"
+        "}}";
 
     struct elastic_fts_backend *backend = (struct elastic_fts_backend *)_backend;
     const char *operator_arg = (flags & FTS_LOOKUP_FLAG_AND_ARGS) ? "and" : "or";
@@ -1124,6 +1186,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
     /* json query building */
     string_t *query = str_new(pool, 1024);
     string_t *match_query = str_new(pool, 1024);
+    string_t *match_query_raw = str_new(pool, 1024);
     string_t *fields = str_new(pool, 1024);
     string_t *fields_not = str_new(pool, 1024);
     struct elastic_date_filter date_filter = {0};
@@ -1142,7 +1205,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
     f_debug("box_guid: %s", box_guid);
 
     /* attempt to build the match_query and collect date filters */
-    if (!elastic_add_definite_query_args(fields, fields_not, match_query, args, &date_filter)) {
+    if (!elastic_add_definite_query_args(fields, fields_not, match_query, match_query_raw, args, &date_filter)) {
         f_debug("return -1");
         return -1;
     }
@@ -1264,48 +1327,130 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
         const char *match_query_str = str_c(match_query);
         /* check if we have only one field (no comma in the string after removing trailing comma) */
         if (strchr(fields_str, ',') == NULL) {
-            /* single field - use match query for better performance */
-            /* remove quotes from field name (fields_str contains "fieldname") */
+            /* single field */
             const char *field_name = fields_str;
             size_t field_name_len = strlen(field_name);
+            string_t *field_name_clean = NULL;
             if (field_name_len >= 2 && field_name[0] == '"' && field_name[field_name_len-1] == '"') {
-                /* extract field name without quotes */
-                string_t *field_name_clean = str_new(pool, 64);
+                field_name_clean = str_new(pool, 64);
                 buffer_append(field_name_clean, field_name + 1, field_name_len - 2);
-                str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+            }
+            const char *fn = field_name_clean ? str_c(field_name_clean) : fields_str;
+
+            /* Use wildcard on from/to/sender/cc/bcc for full-address search (works with old index).
+             * Use raw query (match_query_raw) to avoid double-escaping: wildcard-escape then JSON-escape once. */
+            if (fn != NULL && elastic_field_is_email_address(fn)) {
+                const char *raw_str = str_c(match_query_raw);
+                size_t raw_len = str_len(match_query_raw);
+                string_t *wb = str_new(pool, 512);
+                str_append_c(wb, '*');
+                str_append_wildcard_escaped(wb, raw_str, raw_len);
+                str_append_c(wb, '*');
+                string_t *wb_json = str_new(pool, 512);
+                str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+                str_printfa(query, JSON_WILDCARD_FULL, fn, str_c(wb_json));
             } else {
-                str_printfa(query, JSON_MATCH, fields_str, match_query_str, operator_arg);
+                if (field_name_clean != NULL) {
+                    str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+                } else {
+                    str_printfa(query, JSON_MATCH, fields_str, match_query_str, operator_arg);
+                }
             }
         } else {
-            /* multiple fields - use multi_match with optimization */
-            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
-                                   operator_arg, fields_str);
+            /* multiple fields - email fields use wildcard, others use match; combine in bool */
+            const char *raw_str = str_c(match_query_raw);
+            size_t raw_len = str_len(match_query_raw);
+            string_t *wb = str_new(pool, 512);
+            str_append_c(wb, '*');
+            str_append_wildcard_escaped(wb, raw_str, raw_len);
+            str_append_c(wb, '*');
+            string_t *wb_json = str_new(pool, 512);
+            str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+            if (strcmp(operator_arg, "or") == 0) {
+                str_append(query, "{\"bool\":{\"should\":[");
+            } else {
+                str_append(query, "{\"bool\":{\"must\":[");
+            }
+            string_t *fn_temp = str_new(pool, 64);
+            const char *p = fields_str;
+            bool first = TRUE;
+            while (*p) {
+                p = parse_next_quoted_field(p, fn_temp);
+                if (p == NULL || str_len(fn_temp) == 0) break;
+                if (!first) str_append(query, ",");
+                first = FALSE;
+                if (elastic_field_is_email_address(str_c(fn_temp))) {
+                    str_printfa(query, JSON_WILDCARD_FULL, str_c(fn_temp), str_c(wb_json));
+                } else {
+                    str_printfa(query, JSON_MATCH, str_c(fn_temp), match_query_str, operator_arg);
+                }
+            }
+            str_append(query, "]}}");
         }
         str_append(query, "]");
     }
 
     if (str_len(fields_not) > 0 && str_len(match_query) > 0) {
         str_append(query, ",\"must_not\":[");
-        /* optimize: use match query for single field, multi_match for multiple fields */
         const char *fields_not_str = str_c(fields_not);
         const char *match_query_str = str_c(match_query);
         if (strchr(fields_not_str, ',') == NULL) {
-            /* single field - use match query for better performance */
-            /* remove quotes from field name (fields_not_str contains "fieldname") */
             const char *field_name = fields_not_str;
             size_t field_name_len = strlen(field_name);
+            string_t *field_name_clean = NULL;
             if (field_name_len >= 2 && field_name[0] == '"' && field_name[field_name_len-1] == '"') {
-                /* extract field name without quotes */
-                string_t *field_name_clean = str_new(pool, 64);
+                field_name_clean = str_new(pool, 64);
                 buffer_append(field_name_clean, field_name + 1, field_name_len - 2);
-                str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+            }
+            const char *fn = field_name_clean ? str_c(field_name_clean) : fields_not_str;
+
+            if (fn != NULL && elastic_field_is_email_address(fn)) {
+                const char *raw_str = str_c(match_query_raw);
+                size_t raw_len = str_len(match_query_raw);
+                string_t *wb = str_new(pool, 512);
+                str_append_c(wb, '*');
+                str_append_wildcard_escaped(wb, raw_str, raw_len);
+                str_append_c(wb, '*');
+                string_t *wb_json = str_new(pool, 512);
+                str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+                str_printfa(query, JSON_WILDCARD_FULL, fn, str_c(wb_json));
             } else {
-                str_printfa(query, JSON_MATCH, fields_not_str, match_query_str, operator_arg);
+                if (field_name_clean != NULL) {
+                    str_printfa(query, JSON_MATCH, str_c(field_name_clean), match_query_str, operator_arg);
+                } else {
+                    str_printfa(query, JSON_MATCH, fields_not_str, match_query_str, operator_arg);
+                }
             }
         } else {
-            /* multiple fields - use multi_match with optimization */
-            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
-                                   operator_arg, fields_not_str);
+            /* multiple fields - email fields use wildcard, others use match; combine in bool, respect operator_arg */
+            const char *raw_str = str_c(match_query_raw);
+            size_t raw_len = str_len(match_query_raw);
+            string_t *wb = str_new(pool, 512);
+            str_append_c(wb, '*');
+            str_append_wildcard_escaped(wb, raw_str, raw_len);
+            str_append_c(wb, '*');
+            string_t *wb_json = str_new(pool, 512);
+            str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+            if (strcmp(operator_arg, "or") == 0) {
+                str_append(query, "{\"bool\":{\"should\":[");
+            } else {
+                str_append(query, "{\"bool\":{\"must\":[");
+            }
+            string_t *fn_temp_not = str_new(pool, 64);
+            const char *p_not = fields_not_str;
+            bool first_not = TRUE;
+            while (*p_not) {
+                p_not = parse_next_quoted_field(p_not, fn_temp_not);
+                if (p_not == NULL || str_len(fn_temp_not) == 0) break;
+                if (!first_not) str_append(query, ",");
+                first_not = FALSE;
+                if (elastic_field_is_email_address(str_c(fn_temp_not))) {
+                    str_printfa(query, JSON_WILDCARD_FULL, str_c(fn_temp_not), str_c(wb_json));
+                } else {
+                    str_printfa(query, JSON_MATCH, str_c(fn_temp_not), match_query_str, operator_arg);
+                }
+            }
+            str_append(query, "]}}");
         }
         str_append(query, "]");
     }
