@@ -180,6 +180,24 @@ elastic_field_is_email_address(const char *field_name)
             strcmp(field_name, "bcc") == 0);
 }
 
+/* Parse next quoted field from fields string (e.g. "\"from\",\"to\""). Returns pointer after field or NULL. */
+static const char *
+parse_next_quoted_field(const char *input, string_t *field_name_out)
+{
+    const char *p = input;
+    while (*p == ' ' || *p == ',') p++;
+    if (!*p || *p != '"') return NULL;
+    p++;
+    str_truncate(field_name_out, 0);
+    while (*p && *p != '"') {
+        str_append_c(field_name_out, *p);
+        p++;
+    }
+    if (*p != '"') return NULL;
+    p++;
+    return p;
+}
+
 /* Escape wildcard special chars (\ * ?) for Elasticsearch wildcard query */
 static void
 str_append_wildcard_escaped(string_t *dest, const char *data, size_t len)
@@ -1339,9 +1357,35 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
                 }
             }
         } else {
-            /* multiple fields - use multi_match with optimization */
-            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
-                                   operator_arg, fields_str);
+            /* multiple fields - email fields use wildcard, others use match; combine in bool */
+            const char *raw_str = str_c(match_query_raw);
+            size_t raw_len = str_len(match_query_raw);
+            string_t *wb = str_new(pool, 512);
+            str_append_c(wb, '*');
+            str_append_wildcard_escaped(wb, raw_str, raw_len);
+            str_append_c(wb, '*');
+            string_t *wb_json = str_new(pool, 512);
+            str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+            if (strcmp(operator_arg, "or") == 0) {
+                str_append(query, "{\"bool\":{\"should\":[");
+            } else {
+                str_append(query, "{\"bool\":{\"must\":[");
+            }
+            string_t *fn_temp = str_new(pool, 64);
+            const char *p = fields_str;
+            bool first = TRUE;
+            while (*p) {
+                p = parse_next_quoted_field(p, fn_temp);
+                if (p == NULL || str_len(fn_temp) == 0) break;
+                if (!first) str_append(query, ",");
+                first = FALSE;
+                if (elastic_field_is_email_address(str_c(fn_temp))) {
+                    str_printfa(query, JSON_WILDCARD_FULL, str_c(fn_temp), str_c(wb_json));
+                } else {
+                    str_printfa(query, JSON_MATCH, str_c(fn_temp), match_query_str, operator_arg);
+                }
+            }
+            str_append(query, "]}}");
         }
         str_append(query, "]");
     }
@@ -1378,8 +1422,35 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
                 }
             }
         } else {
-            str_printfa(query, JSON_MULTI_MATCH, match_query_str,
-                                   operator_arg, fields_not_str);
+            /* multiple fields - email fields use wildcard, others use match; combine in bool, respect operator_arg */
+            const char *raw_str = str_c(match_query_raw);
+            size_t raw_len = str_len(match_query_raw);
+            string_t *wb = str_new(pool, 512);
+            str_append_c(wb, '*');
+            str_append_wildcard_escaped(wb, raw_str, raw_len);
+            str_append_c(wb, '*');
+            string_t *wb_json = str_new(pool, 512);
+            str_append_json_escaped(wb_json, str_c(wb), str_len(wb));
+            if (strcmp(operator_arg, "or") == 0) {
+                str_append(query, "{\"bool\":{\"should\":[");
+            } else {
+                str_append(query, "{\"bool\":{\"must\":[");
+            }
+            string_t *fn_temp_not = str_new(pool, 64);
+            const char *p_not = fields_not_str;
+            bool first_not = TRUE;
+            while (*p_not) {
+                p_not = parse_next_quoted_field(p_not, fn_temp_not);
+                if (p_not == NULL || str_len(fn_temp_not) == 0) break;
+                if (!first_not) str_append(query, ",");
+                first_not = FALSE;
+                if (elastic_field_is_email_address(str_c(fn_temp_not))) {
+                    str_printfa(query, JSON_WILDCARD_FULL, str_c(fn_temp_not), str_c(wb_json));
+                } else {
+                    str_printfa(query, JSON_MATCH, str_c(fn_temp_not), match_query_str, operator_arg);
+                }
+            }
+            str_append(query, "]}}");
         }
         str_append(query, "]");
     }
