@@ -40,7 +40,7 @@ fts_elastic_plugin_init_settings(struct mail_user *user,
     set->refresh_by_fts = TRUE;
     set->refresh_on_update = FALSE;
     set->default_date_range_months = 0; /* disabled by default */
-    set->result_size_limit = 10000; /* default ES limit */
+    set->result_size_limit = 1000; /* default ES limit */
 
     tmp = t_strsplit_spaces(str, " ");
     for (; *tmp != NULL; tmp++) {

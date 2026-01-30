@@ -905,7 +905,7 @@ static int fts_backend_elastic_rescan(struct fts_backend *_backend)
 
         /* build json query for user box */
         buffer_set_used_size(query, 0);
-        unsigned int result_size_limit = 10000; /* default ES limit */
+        unsigned int result_size_limit = 1000; /* default ES limit */
         struct fts_elastic_user *fuser = FTS_ELASTIC_USER_CONTEXT(_backend->ns->user);
         if (fuser != NULL) {
             result_size_limit = fuser->set.result_size_limit;
@@ -929,7 +929,7 @@ static int fts_backend_elastic_rescan(struct fts_backend *_backend)
         // we need scroll request because we don't know in advance
         // how many messages are actually in elastic
         // the point of rescan is to remove expunges and fix elastic
-        ret = elastic_connection_search_scroll(backend->conn, pool, query, result);
+        ret = elastic_connection_search_scroll(backend->conn, pool, query, result_size_limit, result);
         if (ret < 0) {
             i_error("fts_elastic: Failed to search uids in elastic for mailbox %s",
                     mailbox_get_vname(box));
@@ -1225,7 +1225,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
 
     /* get settings */
     struct fts_elastic_user *fuser = FTS_ELASTIC_USER_CONTEXT(_backend->ns->user);
-    unsigned int result_size_limit = 10000; /* default ES limit */
+    unsigned int result_size_limit = 1000; /* default ES limit */
     bool apply_default_date_range = FALSE;
     
     if (fuser != NULL) {
@@ -1469,7 +1469,7 @@ fts_backend_elastic_lookup(struct fts_backend *_backend, struct mailbox *box,
     }
 
     if (status.messages > result_size_limit) {
-        ret = elastic_connection_search_scroll(backend->conn, pool, query, result_r);
+        ret = elastic_connection_search_scroll(backend->conn, pool, query, result_size_limit, result_r);
     } else {
         ret = elastic_connection_search(backend->conn, pool, query, result_r);
     }
