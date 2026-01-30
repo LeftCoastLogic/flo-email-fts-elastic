@@ -2,7 +2,7 @@
 fts-elastic is a [Dovecot full-text search](https://doc.dovecot.org/configuration_manual/fts/) indexing plugin that uses [ElasticSearch](https://www.elastic.co/) as a backend.
 
 Dovecot communicates to ES using HTTP/JSON queries. It supports automatic indexing and searching of e-mail.
-For mailboxes with more than 10000 messages it uses [elastic scroll API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-request-body.html#request-body-search-scroll).
+When a mailbox has more messages than the configured `result_size_limit`, the plugin uses the [Elasticsearch Scroll API](https://www.elastic.co/guide/en/elasticsearch/reference/current/search-request-body.html#request-body-search-scroll) to fetch all matching results in batches.
 
 [![Packaging status](https://repology.org/badge/vertical-allrepos/dovecot-fts-elastic.svg)](https://repology.org/project/dovecot-fts-elastic/versions)
 
@@ -61,7 +61,7 @@ and (re)start dovecot:
 * debug Enables HTTP debugging
 * rawlog_dir is directory where HTTP communication with elasticsearch server is written (useful for debugging plugin or elastic schema)
 * default_date_range={0/disabled,1/1month,3/3months,6/6months} Automatically apply date range filter when searching body field to improve performance with large mailboxes. This setting adds a date range filter (last N months) to body searches when user doesn't specify a date range. User-specified date ranges (e.g., SINCE 1-MONTH-AGO) will override this default. Recommended: 3 months for optimal performance. (default=0/disabled)
-* result_size_limit=\<positive integer\> Maximum number of results to return from Elasticsearch per query. When mailbox has more messages than this limit, scroll API will be used automatically. (default=10000)
+* result_size_limit=\<positive integer\> Maximum number of results to return from Elasticsearch per query. When mailbox has more messages than this limit, scroll API will be used automatically. (default=1000)
 
 ## ElasticSearch index
 This plugin stores all message in one elastic index. You can use [sharding](https://www.elastic.co/guide/en/elasticsearch/reference/current/scalability.html) to support large numbers of users. Since it uses [routing key](https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-routing-field.html), updates and searches are accessing only one shard.

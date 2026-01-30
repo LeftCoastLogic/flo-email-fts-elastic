@@ -16,6 +16,7 @@
 #include "elastic-connection.h"
 
 #include <json-c/json.h>
+#include <limits.h>
 #include <stdio.h>
 
 
@@ -510,9 +511,11 @@ int elastic_connection_search(struct elastic_connection *conn,
 /* Performs elastic search query with scroll
  * parses json response
  * and fills fts_result
+ * batch_size: same as "size" in query; loop continues while last batch had >= batch_size hits
  */
 int elastic_connection_search_scroll(struct elastic_connection *conn,
                               pool_t pool, string_t *query,
+                              unsigned int batch_size,
                               struct fts_result *result_r)
 {
     f_debug("start");
@@ -545,15 +548,23 @@ int elastic_connection_search_scroll(struct elastic_connection *conn,
         return 0;
     }
 
+    /* accumulate total hits across all batches (conn->ctx->found is per-batch) */
+    int total_found = conn->ctx->found;
+
+    /* scroll threshold: cap at INT_MAX so comparison with ctx->found (int) is well-defined */
+    int scroll_threshold = (batch_size > (unsigned int)INT_MAX) ? INT_MAX : (int)batch_size;
+
     /* TODO: strip index (last segment) from path to allow elastic behind proxy */
     path = "/_search/scroll";
-    while (conn->ctx->found >= 9998) {
+    /* continue scrolling while last batch was full (might be more results) */
+    while (scroll_threshold > 0 && conn->ctx->found >= scroll_threshold) {
         conn->ctx->found = 0;
         str_truncate(query, 0);
         str_printfa(query, "{\"scroll\":\"%s\", \"scroll_id\":\"%s\"}",
                             SCROLL_TIMEOUT,
                             conn->ctx->scroll_id);
         elastic_connection_post(conn, path, query);
+        total_found += conn->ctx->found;
     }
     /* DELETE search scroll context */
     conn->post_type = ELASTIC_POST_TYPE_DELETE;
@@ -566,8 +577,8 @@ int elastic_connection_search_scroll(struct elastic_connection *conn,
         return -1;
     }
 
-    f_debug("return %d", conn->ctx->found);
-    return conn->ctx->found;
+    f_debug("return %d", total_found);
+    return total_found;
 }
 
 /* Performs elastic search delete by query
